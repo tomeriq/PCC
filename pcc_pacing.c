@@ -34,13 +34,24 @@
 #define PREV_MONITOR(index) ((index) > 0 ? ((index) - 1) : (NUMBER_OF_INTERVALS - 1))
 #define DEFAULT_TTL 1000
 #define MINIMUM_RATE (1000000)
-#define INITIAL_RATE (10000000)
+#define INITIAL_RATE (1000000)
 
 static void on_monitor_start(struct sock *sk, int index);
+
+typedef enum {
+	PCC_STATE_START = 0,
+	PCC_STATE_DECISION_MAKING_1,
+	PCC_STATE_DECISION_MAKING_2,
+	PCC_STATE_DECISION_MAKING_3,
+	PCC_STATE_DECISION_MAKING_4,
+	PCC_STATE_WAIT_FOR_DECISION,
+	PCC_STATE_RATE_ADJUSTMENT,
+} pcc_state_t;
 
 struct monitor {
 	u8 valid;
 	u8 decision_making_id;
+	pcc_state_t state;
 	unsigned long end_time;
 	u32 snd_start_seq;
 	u32 snd_end_seq;
@@ -53,15 +64,6 @@ struct monitor {
 	struct timespec start_time;
 };
 
-typedef enum {
-	PCC_STATE_START = 0,
-	PCC_STATE_DECISION_MAKING_1,
-	PCC_STATE_DECISION_MAKING_2,
-	PCC_STATE_DECISION_MAKING_3,
-	PCC_STATE_DECISION_MAKING_4,
-	PCC_STATE_WAIT_FOR_DECISION,
-	PCC_STATE_RATE_ADJUSTMENT,
-} pcc_state_t;
 
 struct pccdata {
 	struct monitor monitor_intervals[NUMBER_OF_INTERVALS];
@@ -90,7 +92,7 @@ static void init_monitor(struct monitor * mon, struct sock *sk)
 
 	mon->valid = 0;
 	mon->start_time = CURRENT_TIME;
-	mon->end_time = ca->pcc->last_rtt;
+	mon->end_time = ca->pcc->last_rtt * 3;
 	mon->snd_start_seq = tp->snd_nxt;
 	mon->snd_end_seq = 0;
 	mon->last_acked_seq = tp->snd_nxt;
@@ -100,6 +102,7 @@ static void init_monitor(struct monitor * mon, struct sock *sk)
 	mon->utility = 0;
 	mon->decision_making_id = 0;
 	mon->rtt = ca->pcc->last_rtt;
+	mon->state = ca->pcc->state;
 }
 
 static void init_pcc_struct(struct sock *sk, struct pcctcp *ca)
@@ -147,17 +150,22 @@ static s64 calc_utility(struct monitor * mon, struct sock *sk)
 	u64 sent = (DEFAULT_TTL - mon->ttl) * tp->advmss;
 	struct timespec length = timespec_sub(CURRENT_TIME, mon->start_time);
 	u64 length_us = length.tv_sec * 1000000 + length.tv_nsec / 1000;
-	fixedpt rate = fixedpt_div(fixedpt_fromint(sent), fixedpt_fromint(length_us));
+	fixedpt rate = fixedpt_mul(fixedpt_div(fixedpt_fromint(sent), fixedpt_fromint(length_us)), fixedpt_rconst(1000000));
 	fixedpt p = fixedpt_div(fixedpt_fromint(mon->bytes_lost), (fixedpt_fromint(sent)));
 	fixedpt utility;
+	fixedpt time = fixedpt_fromint(length.tv_sec) + fixedpt_div(fixedpt_fromint(length.tv_nsec), fixedpt_rconst(1000));
 
 	if (sent < mon->bytes_lost) {
 		DBG_PRINT("BUG: for some reason, lost more than sent\n");
 	}
 
 	utility = (rate - (fixedpt_mul(rate, fixedpt_pow(FIXEDPT_ONE + p, fixedpt_rconst(2.5)) - FIXEDPT_ONE) ));
+	//utility = fixedpt_div(fixedpt_fromint(mon->snd_end_seq - mon->snd_start_seq), time);
+	//utility = (fixedpt_div(fixedpt_fromint(sent - mon->bytes_lost), time) - fixedpt_div(fixedpt_mul(fixedpt_rconst(20), fixedpt_fromint(mon->bytes_lost)), time));
+	//utility = fixedpt_div(fixedpt_fromint(sent -mon->bytes_lost), time);
 	
-	DBG_PRINT("[PCC] calculating utility: rate: %llu, sent: %llu, lost: %u, time: %u, utility: %d, sent (by segments): %u\n", mon->rate, sent, mon->bytes_lost, length_us, (s32)(utility >> FIXEDPT_WBITS), (DEFAULT_TTL - mon->ttl) * tp->advmss);
+	
+	DBG_PRINT("[PCC] calculating utility: rate (limit): %llu, rate (actual): %llu, sent (by sequence): %llu, lost: %u, time: %u, utility: %d, sent (by segments): %u, state: %d\n", mon->rate, rate >> FIXEDPT_WBITS, mon->snd_end_seq - mon->snd_start_seq, mon->bytes_lost, length_us, (s32)(utility >> FIXEDPT_WBITS), (DEFAULT_TTL - mon->ttl) * tp->advmss, mon->state);
 
 	return utility;
 }
@@ -178,32 +186,32 @@ static void on_monitor_start(struct sock *sk, int index)
 			DBG_PRINT("[PCC] in start state (interval %d)\n", index);
 			break;
 		case PCC_STATE_DECISION_MAKING_1:
-			rate = rate + (ca->pcc->decision_making_attempts * 5 * (rate / 100));
+			rate = rate + (ca->pcc->decision_making_attempts * 1 * (rate / 100));
 			ca->pcc->state = PCC_STATE_DECISION_MAKING_2;
 			mon->decision_making_id = 1;
 			DBG_PRINT("[PCC] in DM 1 state (interval %d)\n", index);
 
 			break;
 		case PCC_STATE_DECISION_MAKING_2:
-			rate = rate - (ca->pcc->decision_making_attempts * 5 * (rate / 100));
+			rate = rate - (ca->pcc->decision_making_attempts * 1 * (rate / 100));
 			ca->pcc->state = PCC_STATE_DECISION_MAKING_3;
 			mon->decision_making_id = 2;
 			DBG_PRINT("[PCC] in DM 2 state (interval %d)\n", index);
 			break;
 		case PCC_STATE_DECISION_MAKING_3:
-			rate = rate + (ca->pcc->decision_making_attempts * 5 * (rate / 100));
+			rate = rate + (ca->pcc->decision_making_attempts * 1 * (rate / 100));
 			ca->pcc->state = PCC_STATE_DECISION_MAKING_4;
 			mon->decision_making_id = 3;
 			DBG_PRINT("[PCC] in DM 3 state (interval %d)\n", index);
 			break;
 		case PCC_STATE_DECISION_MAKING_4:
-			rate = rate - (ca->pcc->decision_making_attempts * 5 * (rate / 100));
+			rate = rate - (ca->pcc->decision_making_attempts * 1 * (rate / 100));
 			ca->pcc->state = PCC_STATE_WAIT_FOR_DECISION;
 			mon->decision_making_id = 4;
 			DBG_PRINT("[PCC] in DM 4 state (interval %d)\n", index);
 			break;
 		case PCC_STATE_RATE_ADJUSTMENT:
-			rate = rate + ((rate / 100) * ca->pcc->direction * ca->pcc->rate_adjustment_tries * 5);
+			rate = rate + ((rate / 100) * ca->pcc->direction * ca->pcc->rate_adjustment_tries * 1);
 			if ((ca->pcc->direction > 0 && rate < ca->pcc->next_rate) || (ca->pcc->direction < 0 && rate > ca->pcc->next_rate))
 			{
 				DBG_PRINT("[PCC] overflow in rate adjustment." \
@@ -278,7 +286,7 @@ static void on_monitor_end(struct sock *sk, int index)
 		DBG_PRINT("got utility %lld for monitor interval %d\n", mon->utility, index);
 	}
 
-	if (ca->pcc->snd_count > 3 && mon->utility < prev_mon->utility && ((ca->pcc->state == PCC_STATE_START) || ca->pcc->state == PCC_STATE_RATE_ADJUSTMENT)) {
+	if (mon->state != PCC_STATE_WAIT_FOR_DECISION && ca->pcc->snd_count > 3 && mon->utility < prev_mon->utility && ((ca->pcc->state == PCC_STATE_START) || ca->pcc->state == PCC_STATE_RATE_ADJUSTMENT)) {
 		ca->pcc->state = PCC_STATE_DECISION_MAKING_1;
 		ca->pcc->decision_making_attempts = 1;
 		ca->pcc->next_rate = prev_mon->rate;
@@ -313,10 +321,10 @@ static void check_end_of_monitor_interval(struct sock *sk)
 	u32 length_us = length.tv_sec * 1000000 + length.tv_nsec / 1000;
 
 	if (mon->ttl > 980) {
-		if (length_us > mon->end_time) {
+		while (length_us > mon->end_time) {
 			mon->end_time += 50;
 		}
-	} else if ((length_us > mon->end_time) || mon->ttl <= 0) {
+	} else if ((mon->snd_start_seq != mon->snd_end_seq) && ((length_us > mon->end_time) || mon->ttl <= 0)) {
 		ca->pcc->current_interval = (ca->pcc->current_interval + 1) % NUMBER_OF_INTERVALS;
 		mon = ca->pcc->monitor_intervals + ca->pcc->current_interval;
 
@@ -333,7 +341,7 @@ static void check_end_of_monitor_interval(struct sock *sk)
 		}
 		length = timespec_sub(CURRENT_TIME, loop_mon->start_time);
 		length_us = length.tv_sec * 1000000 + length.tv_nsec / 1000;
-		if (((length_us > loop_mon->end_time)) && 
+		if (loop_mon->snd_start_seq != loop_mon->snd_end_seq && ((length_us > loop_mon->end_time)) && 
 			!after(loop_mon->snd_end_seq, loop_mon->last_acked_seq)) {
 			on_interval_graceful_end(sk, i);
 			loop_mon->valid = 0;
@@ -404,14 +412,14 @@ static void update_interval_with_received_acks(struct sock *sk)
 		}
 		if (tp->sacked_out) {
 			for (j = 0; j < 4; j++) {
-				if (sack_cache[j].start_seq != 0 && sack_cache[j].end_seq != 0) {
+				if (sack_cache[j].start_seq != 0 && sack_cache[j].end_seq != 0 && before(loop_mon->last_acked_seq, loop_mon->snd_end_seq)) {
 					if (before(loop_mon->last_acked_seq, sack_cache[j].start_seq)) {
 						if (before(sack_cache[j].start_seq, loop_mon->snd_end_seq)) {
-							int lost = sack_cache[j].start_seq - loop_mon->last_acked_seq;
+							s32 lost = sack_cache[j].start_seq - loop_mon->last_acked_seq;
 							loop_mon->bytes_lost += lost;
 							DBG_PRINT("monitor %d lost from start sack (%u-%u) to last acked (%u), lost :%d\n", i, sack_cache[j].start_seq, sack_cache[j].end_seq, loop_mon->last_acked_seq, lost);
 						} else {
-							int lost = loop_mon->snd_end_seq - loop_mon->last_acked_seq;
+							s32 lost = loop_mon->snd_end_seq - loop_mon->last_acked_seq;
 							loop_mon->bytes_lost += lost;
 							DBG_PRINT("monitor %d lost from last acked (%u) to end of monitor (%u), lost: %d\n", i, loop_mon->last_acked_seq, loop_mon->snd_end_seq, lost);
 						}
