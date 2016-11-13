@@ -92,7 +92,7 @@ static void init_monitor(struct monitor * mon, struct sock *sk)
 
 	mon->valid = 0;
 	mon->start_time = CURRENT_TIME;
-	mon->end_time = ca->pcc->last_rtt * 3;
+	mon->end_time = ca->pcc->last_rtt;
 	mon->snd_start_seq = tp->snd_nxt;
 	mon->snd_end_seq = 0;
 	mon->last_acked_seq = tp->snd_nxt;
