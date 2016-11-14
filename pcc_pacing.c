@@ -159,11 +159,12 @@ static s64 calc_utility(struct monitor * mon, struct sock *sk)
 		DBG_PRINT("BUG: for some reason, lost more than sent\n");
 	}
 
-	utility = (rate - (fixedpt_mul(rate, fixedpt_pow(FIXEDPT_ONE + p, fixedpt_rconst(2.5)) - FIXEDPT_ONE) ));
+	//utility = (rate - (fixedpt_mul(rate, fixedpt_pow(FIXEDPT_ONE + p, fixedpt_rconst(2.5)) - FIXEDPT_ONE) ));
 	//utility = fixedpt_div(fixedpt_fromint(mon->snd_end_seq - mon->snd_start_seq), time);
 	//utility = (fixedpt_div(fixedpt_fromint(sent - mon->bytes_lost), time) - fixedpt_div(fixedpt_mul(fixedpt_rconst(20), fixedpt_fromint(mon->bytes_lost)), time));
 	//utility = fixedpt_div(fixedpt_fromint(sent -mon->bytes_lost), time);
-	
+	utility = fixedpt_div(fixedpt_fromint(sent - mon->bytes_lost), time);
+	utility = fixedpt_mul(utility, FIXEDPT_ONE - fixedpt_div(FIXEDPT_ONE, FIXEDPT_ONE + fixedpt_exp(fixedpt_mul(fixedpt_fromint(-100), fixedpt_div(fixedpt_fromint(mon->bytes_lost), fixedpt_fromint(sent)) - fixedpt_rconst(0.05))))) - fixedpt_div(fixedpt_fromint(mon->bytes_lost), time);
 	
 	DBG_PRINT("[PCC] calculating utility: rate (limit): %llu, rate (actual): %llu, sent (by sequence): %llu, lost: %u, time: %u, utility: %d, sent (by segments): %u, state: %d\n", mon->rate, rate >> FIXEDPT_WBITS, mon->snd_end_seq - mon->snd_start_seq, mon->bytes_lost, length_us, (s32)(utility >> FIXEDPT_WBITS), (DEFAULT_TTL - mon->ttl) * tp->advmss, mon->state);
 
