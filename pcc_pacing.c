@@ -33,7 +33,7 @@
 #define NUMBER_OF_INTERVALS (30)
 #define PREV_MONITOR(index) ((index) > 0 ? ((index) - 1) : (NUMBER_OF_INTERVALS - 1))
 #define DEFAULT_TTL 1000
-#define MINIMUM_RATE (1000000)
+#define MINIMUM_RATE (100000)
 #define INITIAL_RATE (1000000)
 
 static void on_monitor_start(struct sock *sk, int index);
@@ -119,10 +119,10 @@ static void init_pcc_struct(struct sock *sk, struct pcctcp *ca)
 
 	DBG_PRINT("[PCC] initialized pcc struct");
 	memset(ca->pcc, 0, sizeof(struct pccdata));
+	ca->pcc->next_rate = INITIAL_RATE;
 	init_monitor(&(ca->pcc->monitor_intervals[0]), sk);
 	on_monitor_start(sk, ca->pcc->current_interval);
 	ca->pcc->monitor_intervals[ca->pcc->current_interval].valid = 1;
-	ca->pcc->next_rate = INITIAL_RATE;
 
 }
 
@@ -159,12 +159,14 @@ static s64 calc_utility(struct monitor * mon, struct sock *sk)
 		DBG_PRINT("BUG: for some reason, lost more than sent\n");
 	}
 
-	//utility = (rate - (fixedpt_mul(rate, fixedpt_pow(FIXEDPT_ONE + p, fixedpt_rconst(2.5)) - FIXEDPT_ONE) ));
+	rate = fixedpt_fromint(mon->rate);
+	utility = (rate - (fixedpt_mul(rate, fixedpt_pow(FIXEDPT_ONE + p, fixedpt_rconst(2.5)) - FIXEDPT_ONE) ));
 	//utility = fixedpt_div(fixedpt_fromint(mon->snd_end_seq - mon->snd_start_seq), time);
 	//utility = (fixedpt_div(fixedpt_fromint(sent - mon->bytes_lost), time) - fixedpt_div(fixedpt_mul(fixedpt_rconst(20), fixedpt_fromint(mon->bytes_lost)), time));
 	//utility = fixedpt_div(fixedpt_fromint(sent -mon->bytes_lost), time);
-	utility = fixedpt_div(fixedpt_fromint(sent - mon->bytes_lost), time);
-	utility = fixedpt_mul(utility, FIXEDPT_ONE - fixedpt_div(FIXEDPT_ONE, FIXEDPT_ONE + fixedpt_exp(fixedpt_mul(fixedpt_fromint(-100), fixedpt_div(fixedpt_fromint(mon->bytes_lost), fixedpt_fromint(sent)) - fixedpt_rconst(0.05))))) - fixedpt_div(fixedpt_fromint(mon->bytes_lost), time);
+	
+	//utility = fixedpt_div(fixedpt_fromint(sent - mon->bytes_lost), time);
+	//utility = fixedpt_mul(utility, FIXEDPT_ONE - fixedpt_div(FIXEDPT_ONE, FIXEDPT_ONE + fixedpt_exp(fixedpt_mul(fixedpt_fromint(-100), fixedpt_div(fixedpt_fromint(mon->bytes_lost), fixedpt_fromint(sent)) - fixedpt_rconst(0.05))))) - fixedpt_div(fixedpt_fromint(mon->bytes_lost), time);
 	
 	DBG_PRINT("[PCC] calculating utility: rate (limit): %llu, rate (actual): %llu, sent (by sequence): %llu, lost: %u, time: %u, utility: %d, sent (by segments): %u, state: %d\n", mon->rate, rate >> FIXEDPT_WBITS, mon->snd_end_seq - mon->snd_start_seq, mon->bytes_lost, length_us, (s32)(utility >> FIXEDPT_WBITS), (DEFAULT_TTL - mon->ttl) * tp->advmss, mon->state);
 
@@ -285,6 +287,10 @@ static void on_monitor_end(struct sock *sk, int index)
 	if (mon->ttl != DEFAULT_TTL && mon->snd_end_seq != 0) {
 		mon->utility = calc_utility(mon, sk);
 		DBG_PRINT("got utility %lld for monitor interval %d\n", mon->utility, index);
+	}
+
+	if (mon->state == PCC_STATE_START && prev_mon->snd_end_seq == 0) {
+		return;
 	}
 
 	if (mon->state != PCC_STATE_WAIT_FOR_DECISION && ca->pcc->snd_count > 3 && mon->utility < prev_mon->utility && ((ca->pcc->state == PCC_STATE_START) || ca->pcc->state == PCC_STATE_RATE_ADJUSTMENT)) {
@@ -413,7 +419,10 @@ static void update_interval_with_received_acks(struct sock *sk)
 		}
 		if (tp->sacked_out) {
 			for (j = 0; j < 4; j++) {
-				if (sack_cache[j].start_seq != 0 && sack_cache[j].end_seq != 0 && before(loop_mon->last_acked_seq, loop_mon->snd_end_seq)) {
+				if (!before(loop_mon->last_acked_seq, loop_mon->snd_end_seq)) {
+					continue;
+				}
+				if (sack_cache[j].start_seq != 0 && sack_cache[j].end_seq != 0) {
 					if (before(loop_mon->last_acked_seq, sack_cache[j].start_seq)) {
 						if (before(sack_cache[j].start_seq, loop_mon->snd_end_seq)) {
 							s32 lost = sack_cache[j].start_seq - loop_mon->last_acked_seq;
