@@ -33,8 +33,8 @@
 #define NUMBER_OF_INTERVALS (30)
 #define PREV_MONITOR(index) ((index) > 0 ? ((index) - 1) : (NUMBER_OF_INTERVALS - 1))
 #define DEFAULT_TTL 1000
-#define MINIMUM_RATE (100000)
-#define INITIAL_RATE (1000000)
+#define MINIMUM_RATE (800000)
+#define INITIAL_RATE (4000000)
 
 static void on_monitor_start(struct sock *sk, int index);
 
@@ -148,19 +148,20 @@ static s64 calc_utility(struct monitor * mon, struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	u64 sent = (DEFAULT_TTL - mon->ttl) * tp->advmss;
-	struct timespec length = timespec_sub(CURRENT_TIME, mon->start_time);
-	u64 length_us = length.tv_sec * 1000000 + length.tv_nsec / 1000;
+	u64 length_us = mon->end_time;
 	fixedpt rate = fixedpt_mul(fixedpt_div(fixedpt_fromint(sent), fixedpt_fromint(length_us)), fixedpt_rconst(1000000));
 	fixedpt p = fixedpt_div(fixedpt_fromint(mon->bytes_lost), (fixedpt_fromint(sent)));
 	fixedpt utility;
-	fixedpt time = fixedpt_fromint(length.tv_sec) + fixedpt_div(fixedpt_fromint(length.tv_nsec), fixedpt_rconst(1000));
+	fixedpt time = fixedpt_div(fixedpt_fromint(length_us), fixedpt_rconst(1000000));
 
 	if (sent < mon->bytes_lost) {
 		DBG_PRINT("BUG: for some reason, lost more than sent\n");
 	}
 
-	rate = fixedpt_fromint(mon->rate);
+	//rate = fixedpt_fromint(mon->rate);
 	utility = (rate - (fixedpt_mul(rate, fixedpt_pow(FIXEDPT_ONE + p, fixedpt_rconst(2.5)) - FIXEDPT_ONE) ));
+	//utility = mon->rate * 100 - mon->rate * ((sent + mon->bytes_lost) * (sent + mon->bytes_lost) * 100 / (sent * sent) - 100);
+	//utility = mon->snd_end_seq - mon->snd_start_seq;
 	//utility = fixedpt_div(fixedpt_fromint(mon->snd_end_seq - mon->snd_start_seq), time);
 	//utility = (fixedpt_div(fixedpt_fromint(sent - mon->bytes_lost), time) - fixedpt_div(fixedpt_mul(fixedpt_rconst(20), fixedpt_fromint(mon->bytes_lost)), time));
 	//utility = fixedpt_div(fixedpt_fromint(sent -mon->bytes_lost), time);
@@ -168,6 +169,7 @@ static s64 calc_utility(struct monitor * mon, struct sock *sk)
 	//utility = fixedpt_div(fixedpt_fromint(sent - mon->bytes_lost), time);
 	//utility = fixedpt_mul(utility, FIXEDPT_ONE - fixedpt_div(FIXEDPT_ONE, FIXEDPT_ONE + fixedpt_exp(fixedpt_mul(fixedpt_fromint(-100), fixedpt_div(fixedpt_fromint(mon->bytes_lost), fixedpt_fromint(sent)) - fixedpt_rconst(0.05))))) - fixedpt_div(fixedpt_fromint(mon->bytes_lost), time);
 	
+	rate = fixedpt_mul(fixedpt_div(fixedpt_fromint(sent), fixedpt_fromint(mon->end_time)), fixedpt_rconst(1000000));
 	DBG_PRINT("[PCC] calculating utility: rate (limit): %llu, rate (actual): %llu, sent (by sequence): %llu, lost: %u, time: %u, utility: %d, sent (by segments): %u, state: %d\n", mon->rate, rate >> FIXEDPT_WBITS, mon->snd_end_seq - mon->snd_start_seq, mon->bytes_lost, length_us, (s32)(utility >> FIXEDPT_WBITS), (DEFAULT_TTL - mon->ttl) * tp->advmss, mon->state);
 
 	return utility;
@@ -334,6 +336,7 @@ static void check_end_of_monitor_interval(struct sock *sk)
 	} else if ((mon->snd_start_seq != mon->snd_end_seq) && ((length_us > mon->end_time) || mon->ttl <= 0)) {
 		ca->pcc->current_interval = (ca->pcc->current_interval + 1) % NUMBER_OF_INTERVALS;
 		mon = ca->pcc->monitor_intervals + ca->pcc->current_interval;
+		mon->end_time = length_us;
 
 		if (mon->valid) {
 			DBG_PRINT(KERN_ERR "[PCC] overrunning interval\n");
