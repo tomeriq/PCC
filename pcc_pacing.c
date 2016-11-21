@@ -92,7 +92,7 @@ static void init_monitor(struct monitor * mon, struct sock *sk)
 
 	mon->valid = 0;
 	mon->start_time = current_kernel_time();
-	mon->end_time = ca->pcc->last_rtt;
+	mon->end_time = (ca->pcc->last_rtt * 5 )/ 3;
 	mon->snd_start_seq = tp->snd_nxt;
 	mon->snd_end_seq = 0;
 	mon->last_acked_seq = tp->snd_nxt;
@@ -177,7 +177,6 @@ static s64 calc_utility(struct monitor * mon, struct sock *sk)
 	
 	//utility = fixedpt_div(fixedpt_fromint(sent - mon->bytes_lost), time);
 	//utility = fixedpt_mul(utility, FIXEDPT_ONE - fixedpt_div(FIXEDPT_ONE, FIXEDPT_ONE + fixedpt_exp(fixedpt_mul(fixedpt_fromint(-100), fixedpt_div(fixedpt_fromint(mon->bytes_lost), fixedpt_fromint(sent)) - fixedpt_rconst(0.05))))) - fixedpt_div(fixedpt_fromint(mon->bytes_lost), time);
-	
 	rate = fixedpt_mul(fixedpt_div(fixedpt_fromint(sent), fixedpt_fromint(length_us)), fixedpt_rconst(1000000));
 	DBG_PRINT("[PCC] calculating utility: rate (limit): %llu, rate (actual): %llu, sent (by sequence): %llu, lost: %u, time: %u, utility: %d, sent (by segments): %u, state: %d\n", mon->rate, rate >> FIXEDPT_WBITS, mon->snd_end_seq - mon->snd_start_seq, mon->bytes_lost, length_us, (s32)(utility >> FIXEDPT_WBITS), (mon->ttl) * tp->advmss, mon->state);
 
@@ -342,9 +341,7 @@ static void check_end_of_monitor_interval(struct sock *sk)
 		while (length_us > mon->end_time) {
 			mon->end_time += 50;
 		}
-	} else if (mon->ttl > 1000 && length_us < 10) {
-		
-	} else if ((mon->snd_start_seq != mon->snd_end_seq) && ((length_us > mon->end_time) || mon->ttl > 1000)) {
+	} else if ((mon->snd_start_seq != mon->snd_end_seq) && ((length_us > mon->end_time) )) {
 		mon->end_time = length_us;
 		DBG_PRINT("current monitor %d finished sending. end time %u\n",ca->pcc->current_interval, mon->end_time);
 		ca->pcc->current_interval = (ca->pcc->current_interval + 1) % NUMBER_OF_INTERVALS;
