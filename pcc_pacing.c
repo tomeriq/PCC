@@ -29,12 +29,12 @@
 
 #define DEFAULT_RATE_LIMIT (2000 * (1<<10))
 #define SUPPORTED_SESSIONS_NUMBER (1024)
-#define LARGE_CWND (200000)
+#define LARGE_CWND (20000000)
 #define NUMBER_OF_INTERVALS (30)
 #define PREV_MONITOR(index) ((index) > 0 ? ((index) - 1) : (NUMBER_OF_INTERVALS - 1))
 #define DEFAULT_TTL 1000
 #define MINIMUM_RATE (800000)
-#define INITIAL_RATE (4000000)
+#define INITIAL_RATE (1000000)
 
 static void on_monitor_start(struct sock *sk, int index);
 
@@ -76,6 +76,7 @@ struct pccdata {
 	int direction;
 	int decision_making_attempts;
 	int rate_adjustment_tries;
+	int decision_directions[4];
 };
 
 
@@ -85,6 +86,52 @@ struct pcctcp {
 	struct pccdata* pcc;
 };
 
+static void shuffle_decision_directions(struct sock *sk)
+{
+	u32 random;
+	u8 ups = 0;
+	struct pcctcp *ca = inet_csk_ca(sk);
+
+	get_random_bytes(&random, sizeof(random));
+	if (random % 2 == 0) {
+		ca->pcc->decision_directions[0] = 1;
+		ups++;
+	} else {
+		ca->pcc->decision_directions[0] = -1;
+	}
+	get_random_bytes(&random, sizeof(random));
+	if (random % 2 == 0) {
+		ca->pcc->decision_directions[1] = 1;
+		ups++;
+	} else {
+		ca->pcc->decision_directions[1] = -1;
+	}
+
+	if (ups == 2) {
+		ca->pcc->decision_directions[2] = -1;
+		ca->pcc->decision_directions[3] = -1;
+		return;
+	} else if (ups == 0) {
+		ca->pcc->decision_directions[2] = 1;
+		ca->pcc->decision_directions[3] = 1;
+		return;
+	}
+
+	get_random_bytes(&random, sizeof(random));
+	if (random % 2 == 0) {
+		ca->pcc->decision_directions[2] = 1;
+		ups++;
+	} else {
+		ca->pcc->decision_directions[2] = -1;
+	}
+
+	if (ups == 3) {
+		ca->pcc->decision_directions[3] = -1;
+	} else if (ups == 1) {
+		ca->pcc->decision_directions[3] = 1;
+	}
+}
+
 static void init_monitor(struct monitor * mon, struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
@@ -92,7 +139,7 @@ static void init_monitor(struct monitor * mon, struct sock *sk)
 
 	mon->valid = 0;
 	mon->start_time = current_kernel_time();
-	mon->end_time = (ca->pcc->last_rtt * 5 )/ 3;
+	mon->end_time = (ca->pcc->last_rtt * 4 )/ 3;
 	mon->snd_start_seq = tp->snd_nxt;
 	mon->snd_end_seq = 0;
 	mon->last_acked_seq = tp->snd_nxt;
@@ -178,8 +225,11 @@ static s64 calc_utility(struct monitor * mon, struct sock *sk)
 	//utility = fixedpt_div(fixedpt_fromint(sent - mon->bytes_lost), time);
 	//utility = fixedpt_mul(utility, FIXEDPT_ONE - fixedpt_div(FIXEDPT_ONE, FIXEDPT_ONE + fixedpt_exp(fixedpt_mul(fixedpt_fromint(-100), fixedpt_div(fixedpt_fromint(mon->bytes_lost), fixedpt_fromint(sent)) - fixedpt_rconst(0.05))))) - fixedpt_div(fixedpt_fromint(mon->bytes_lost), time);
 	rate = fixedpt_mul(fixedpt_div(fixedpt_fromint(sent), fixedpt_fromint(length_us)), fixedpt_rconst(1000000));
-	DBG_PRINT("[PCC] calculating utility: rate (limit): %llu, rate (actual): %llu, sent (by sequence): %llu, lost: %u, time: %u, utility: %d, sent (by segments): %u, state: %d\n", mon->rate, rate >> FIXEDPT_WBITS, mon->snd_end_seq - mon->snd_start_seq, mon->bytes_lost, length_us, (s32)(utility >> FIXEDPT_WBITS), (mon->ttl) * tp->advmss, mon->state);
+	DBG_PRINT("[PCC] calculating utility: rate (limit): %llu, rate (actual): %llu, sent (by sequence): %llu, lost: %u, time: %u, utility: %d, sent segements: %d, sent (by segments): %u, state: %d\n", mon->rate, rate >> FIXEDPT_WBITS, mon->snd_end_seq - mon->snd_start_seq, mon->bytes_lost, length_us, (s32)(utility >> FIXEDPT_WBITS), mon->ttl,  (mon->ttl) * tp->advmss, mon->state);
 
+	if (mon->rate > ((rate >> FIXEDPT_WBITS) / 10) * 12) {
+	//	mon->rate = ((rate >>FIXEDPT_WBITS) / 10) * 11;
+	}
 	return utility;
 }
 
@@ -206,13 +256,13 @@ static void on_monitor_start(struct sock *sk, int index)
 
 			break;
 		case PCC_STATE_DECISION_MAKING_2:
-			rate = rate - (ca->pcc->decision_making_attempts * 1 * (rate / 100));
+			rate = rate + (ca->pcc->decision_making_attempts * 1 * (rate / 100));
 			ca->pcc->state = PCC_STATE_DECISION_MAKING_3;
 			mon->decision_making_id = 2;
 			DBG_PRINT("[PCC] in DM 2 state (interval %d)\n", index);
 			break;
 		case PCC_STATE_DECISION_MAKING_3:
-			rate = rate + (ca->pcc->decision_making_attempts * 1 * (rate / 100));
+			rate = rate - (ca->pcc->decision_making_attempts * 1 * (rate / 100));
 			ca->pcc->state = PCC_STATE_DECISION_MAKING_4;
 			mon->decision_making_id = 3;
 			DBG_PRINT("[PCC] in DM 3 state (interval %d)\n", index);
@@ -259,8 +309,8 @@ static void on_monitor_start(struct sock *sk, int index)
 
 static void make_decision(struct sock *sk, struct pccdata * pcc)
 {
-	if ((pcc->decision_making_intervals[0].utility > pcc->decision_making_intervals[1].utility) &&
-		(pcc->decision_making_intervals[2].utility > pcc->decision_making_intervals[3].utility)) {
+	if ((pcc->decision_making_intervals[0].utility > pcc->decision_making_intervals[2].utility) &&
+		(pcc->decision_making_intervals[1].utility > pcc->decision_making_intervals[3].utility)) {
 		pcc->next_rate = pcc->decision_making_intervals[0].rate;
 		pcc->state = PCC_STATE_RATE_ADJUSTMENT;
 		pcc->direction = 1;
@@ -268,8 +318,8 @@ static void make_decision(struct sock *sk, struct pccdata * pcc)
 		memset(pcc->decision_making_intervals, 0, sizeof(pcc->decision_making_intervals));
 		pcc->decision_making_attempts = 0;
 
-	} else if ((pcc->decision_making_intervals[0].utility < pcc->decision_making_intervals[1].utility) &&
-		(pcc->decision_making_intervals[2].utility < pcc->decision_making_intervals[3].utility)) {
+	} else if ((pcc->decision_making_intervals[0].utility < pcc->decision_making_intervals[2].utility) &&
+		(pcc->decision_making_intervals[1].utility < pcc->decision_making_intervals[3].utility)) {
 		pcc->next_rate = pcc->decision_making_intervals[1].rate;
 		pcc->state = PCC_STATE_RATE_ADJUSTMENT;
 		pcc->direction = -1;
@@ -342,8 +392,8 @@ static void check_end_of_monitor_interval(struct sock *sk)
 			mon->end_time += 50;
 		}
 	} else if ((mon->snd_start_seq != mon->snd_end_seq) && ((length_us > mon->end_time) )) {
+		DBG_PRINT("current monitor %d finished sending. end time should have been %u and was %u\n",ca->pcc->current_interval, mon->end_time, length_us);
 		mon->end_time = length_us;
-		DBG_PRINT("current monitor %d finished sending. end time %u\n",ca->pcc->current_interval, mon->end_time);
 		ca->pcc->current_interval = (ca->pcc->current_interval + 1) % NUMBER_OF_INTERVALS;
 		mon = ca->pcc->monitor_intervals + ca->pcc->current_interval;
 
@@ -377,8 +427,9 @@ static void check_end_of_monitor_interval(struct sock *sk)
 			}
 		} 
 		on_monitor_start(sk, ca->pcc->current_interval);
-		DBG_PRINT(KERN_INFO "[PCC] setting rate:%u (%u Kbps) was %u\n", pcc_get_rate(sk), (pcc_get_rate(sk) * 8) / 1000, sk->sk_pacing_rate);
+		DBG_PRINT(KERN_INFO "[PCC] setting rate:%u (%u Kbps) was %u, max is %u\n", pcc_get_rate(sk), (pcc_get_rate(sk) * 8) / 1000, sk->sk_pacing_rate, sk->sk_max_pacing_rate);
 		sk->sk_pacing_rate = pcc_get_rate(sk);
+		sk->sk_pacing_rate = 1000 * 1024 * 1024;
 		mon->valid = 1;
 	}
 }
@@ -491,6 +542,9 @@ static void pkts_acked(struct sock *sk, const struct ack_sample * sample)
 	do_checks(sk);
 
 	tp->snd_cwnd = LARGE_CWND;
+	tp->rcv_wnd = LARGE_CWND;
+	tp->snd_wnd = LARGE_CWND;
+	tp->snd_cwnd_clamp = LARGE_CWND;
 }
 
 static void in_ack_event(struct sock *sk, u32 flags)
@@ -500,11 +554,8 @@ static void in_ack_event(struct sock *sk, u32 flags)
 
 static void cong_control(struct sock *sk, const struct rate_sample *rs)
 {
-	struct pcctcp *ca = inet_csk_ca(sk);
-	struct monitor * mon = ca->pcc->monitor_intervals + ca->pcc->current_interval;
-	if (rs->is_app_limited) {
-		DBG_PRINT("got a rate limited sample\n");		
-	}
+	//struct pcctcp *ca = inet_csk_ca(sk);
+	//struct monitor * mon = ca->pcc->monitor_intervals + ca->pcc->current_interval;
 	//	update_interval_with_received_acks(sk);
 
 	return;
