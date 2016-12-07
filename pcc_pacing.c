@@ -33,8 +33,8 @@
 #define NUMBER_OF_INTERVALS (30)
 #define PREV_MONITOR(index) ((index) > 0 ? ((index) - 1) : (NUMBER_OF_INTERVALS - 1))
 #define DEFAULT_TTL 1000
-#define MINIMUM_RATE (800000)
-#define INITIAL_RATE (1000000)
+#define MINIMUM_RATE (100000)
+#define INITIAL_RATE (100000)
 
 static void on_monitor_start(struct sock *sk, int index);
 
@@ -169,6 +169,7 @@ static void init_pcc_struct(struct sock *sk, struct pcctcp *ca)
 	DBG_PRINT("[PCC] initialized pcc struct");
 	memset(ca->pcc, 0, sizeof(struct pccdata));
 	ca->pcc->next_rate = INITIAL_RATE;
+	sk->sk_pacing_rate = INITIAL_RATE;
 	init_monitor(&(ca->pcc->monitor_intervals[0]), sk);
 	on_monitor_start(sk, ca->pcc->current_interval);
 	ca->pcc->monitor_intervals[ca->pcc->current_interval].valid = 1;
@@ -510,11 +511,6 @@ static void update_interval_with_received_acks(struct sock *sk)
 
 static void pcctcp_init(struct sock *sk)
 {
-	struct tcp_sock *tp = tcp_sk(sk);
-	struct pcctcp *ca = inet_csk_ca(sk);
-
-	
-	sk->sk_pacing_rate = INITIAL_RATE;
 }
 
 static u32 ssthresh(struct sock *sk)
@@ -522,7 +518,7 @@ static u32 ssthresh(struct sock *sk)
 	struct tcp_sock *tp = tcp_sk(sk);
 
 	do_checks(sk);
-	return TCP_INFINITE_SSTHRESH;
+	return 0;
 }
 
 static void pkts_acked(struct sock *sk, const struct ack_sample * sample)
