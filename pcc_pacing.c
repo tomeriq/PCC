@@ -256,13 +256,13 @@ static void on_monitor_start(struct sock *sk, int index)
 
 			break;
 		case PCC_STATE_DECISION_MAKING_2:
-			rate = rate + (ca->pcc->decision_making_attempts * 1 * (rate / 100));
+			rate = rate - (ca->pcc->decision_making_attempts * 1 * (rate / 100));
 			ca->pcc->state = PCC_STATE_DECISION_MAKING_3;
 			mon->decision_making_id = 2;
 			DBG_PRINT("[PCC] in DM 2 state (interval %d)\n", index);
 			break;
 		case PCC_STATE_DECISION_MAKING_3:
-			rate = rate - (ca->pcc->decision_making_attempts * 1 * (rate / 100));
+			rate = rate + (ca->pcc->decision_making_attempts * 1 * (rate / 100));
 			ca->pcc->state = PCC_STATE_DECISION_MAKING_4;
 			mon->decision_making_id = 3;
 			DBG_PRINT("[PCC] in DM 3 state (interval %d)\n", index);
@@ -309,8 +309,8 @@ static void on_monitor_start(struct sock *sk, int index)
 
 static void make_decision(struct sock *sk, struct pccdata * pcc)
 {
-	if ((pcc->decision_making_intervals[0].utility > pcc->decision_making_intervals[2].utility) &&
-		(pcc->decision_making_intervals[1].utility > pcc->decision_making_intervals[3].utility)) {
+	if ((pcc->decision_making_intervals[0].utility > pcc->decision_making_intervals[1].utility) &&
+		(pcc->decision_making_intervals[2].utility > pcc->decision_making_intervals[3].utility)) {
 		pcc->next_rate = pcc->decision_making_intervals[0].rate;
 		pcc->state = PCC_STATE_RATE_ADJUSTMENT;
 		pcc->direction = 1;
@@ -318,8 +318,8 @@ static void make_decision(struct sock *sk, struct pccdata * pcc)
 		memset(pcc->decision_making_intervals, 0, sizeof(pcc->decision_making_intervals));
 		pcc->decision_making_attempts = 0;
 
-	} else if ((pcc->decision_making_intervals[0].utility < pcc->decision_making_intervals[2].utility) &&
-		(pcc->decision_making_intervals[1].utility < pcc->decision_making_intervals[3].utility)) {
+	} else if ((pcc->decision_making_intervals[0].utility < pcc->decision_making_intervals[1].utility) &&
+			   (pcc->decision_making_intervals[2].utility < pcc->decision_making_intervals[3].utility)) {
 		pcc->next_rate = pcc->decision_making_intervals[1].rate;
 		pcc->state = PCC_STATE_RATE_ADJUSTMENT;
 		pcc->direction = -1;
@@ -429,7 +429,6 @@ static void check_end_of_monitor_interval(struct sock *sk)
 		on_monitor_start(sk, ca->pcc->current_interval);
 		DBG_PRINT(KERN_INFO "[PCC] setting rate:%u (%u Kbps) was %u, max is %u\n", pcc_get_rate(sk), (pcc_get_rate(sk) * 8) / 1000, sk->sk_pacing_rate, sk->sk_max_pacing_rate);
 		sk->sk_pacing_rate = pcc_get_rate(sk);
-		sk->sk_pacing_rate = 1000 * 1024 * 1024;
 		mon->valid = 1;
 	}
 }
@@ -542,9 +541,9 @@ static void pkts_acked(struct sock *sk, const struct ack_sample * sample)
 	do_checks(sk);
 
 	tp->snd_cwnd = LARGE_CWND;
-	tp->rcv_wnd = LARGE_CWND;
-	tp->snd_wnd = LARGE_CWND;
-	tp->snd_cwnd_clamp = LARGE_CWND;
+	//tp->rcv_wnd = LARGE_CWND;
+	//tp->snd_wnd = LARGE_CWND;
+	//tp->snd_cwnd_clamp = LARGE_CWND;
 }
 
 static void in_ack_event(struct sock *sk, u32 flags)
