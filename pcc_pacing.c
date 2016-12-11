@@ -33,8 +33,8 @@
 #define NUMBER_OF_INTERVALS (30)
 #define PREV_MONITOR(index) ((index) > 0 ? ((index) - 1) : (NUMBER_OF_INTERVALS - 1))
 #define DEFAULT_TTL 1000
-#define MINIMUM_RATE (100000)
-#define INITIAL_RATE (100000)
+#define MINIMUM_RATE (800000)
+#define INITIAL_RATE (1000000)
 
 static void on_monitor_start(struct sock *sk, int index);
 
@@ -62,6 +62,7 @@ struct monitor {
 	s64 utility;
 	u32 rtt;
 	struct timespec start_time;
+	u64 actual_rate;
 };
 
 
@@ -77,6 +78,7 @@ struct pccdata {
 	int decision_making_attempts;
 	int rate_adjustment_tries;
 	int decision_directions[4];
+	u64 last_actual_rate;
 };
 
 
@@ -139,7 +141,7 @@ static void init_monitor(struct monitor * mon, struct sock *sk)
 
 	mon->valid = 0;
 	mon->start_time = current_kernel_time();
-	mon->end_time = (ca->pcc->last_rtt * 4 )/ 3;
+	mon->end_time = ((tp->srtt_us >> 3) * 4 )/ 3;
 	mon->snd_start_seq = tp->snd_nxt;
 	mon->snd_end_seq = 0;
 	mon->last_acked_seq = tp->snd_nxt;
@@ -169,6 +171,7 @@ static void init_pcc_struct(struct sock *sk, struct pcctcp *ca)
 	DBG_PRINT("[PCC] initialized pcc struct");
 	memset(ca->pcc, 0, sizeof(struct pccdata));
 	ca->pcc->next_rate = INITIAL_RATE;
+	ca->pcc->last_actual_rate = INITIAL_RATE / 2;
 	sk->sk_pacing_rate = INITIAL_RATE;
 	init_monitor(&(ca->pcc->monitor_intervals[0]), sk);
 	on_monitor_start(sk, ca->pcc->current_interval);
@@ -197,9 +200,12 @@ static void check_if_sent(struct sock *sk)
 static s64 calc_utility(struct monitor * mon, struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
+	struct pcctcp *ca = inet_csk_ca(sk);
 	u64 sent = (mon->ttl) * tp->advmss;
 	u64 length_us = mon->end_time + 1;
 	fixedpt rate = fixedpt_mul(fixedpt_div(fixedpt_fromint(sent), fixedpt_fromint(length_us)), fixedpt_fromint(1000000));
+	mon->actual_rate = rate >> FIXEDPT_FBITS;
+	ca->pcc->last_actual_rate = rate >> FIXEDPT_FBITS;
 	fixedpt p = fixedpt_div(fixedpt_fromint(mon->bytes_lost), (fixedpt_fromint(sent)));
 	fixedpt utility;
 	fixedpt time = fixedpt_div(fixedpt_fromint(length_us), fixedpt_rconst(1000000));
@@ -215,7 +221,6 @@ static s64 calc_utility(struct monitor * mon, struct sock *sk)
 		DBG_PRINT("BUG: actual rate is much bigger than limited rate. length_us = %llu, sent = %llu\n", length_us, sent);
 	}
 
-	//rate = fixedpt_fromint(mon->rate);
 	utility = (rate - (fixedpt_mul(rate, fixedpt_pow(FIXEDPT_ONE + p, fixedpt_rconst(2.5)) - FIXEDPT_ONE) ));
 	//utility = mon->rate * 100 - mon->rate * ((sent + mon->bytes_lost) * (sent + mon->bytes_lost) * 100 / (sent * sent) - 100);
 	//utility = mon->snd_end_seq - mon->snd_start_seq;
@@ -223,8 +228,8 @@ static s64 calc_utility(struct monitor * mon, struct sock *sk)
 	//utility = (fixedpt_div(fixedpt_fromint(sent - mon->bytes_lost), time) - fixedpt_div(fixedpt_mul(fixedpt_rconst(20), fixedpt_fromint(mon->bytes_lost)), time));
 	//utility = fixedpt_div(fixedpt_fromint(sent -mon->bytes_lost), time);
 	
-	//utility = fixedpt_div(fixedpt_fromint(sent - mon->bytes_lost), time);
-	//utility = fixedpt_mul(utility, FIXEDPT_ONE - fixedpt_div(FIXEDPT_ONE, FIXEDPT_ONE + fixedpt_exp(fixedpt_mul(fixedpt_fromint(-100), fixedpt_div(fixedpt_fromint(mon->bytes_lost), fixedpt_fromint(sent)) - fixedpt_rconst(0.05))))) - fixedpt_div(fixedpt_fromint(mon->bytes_lost), time);
+	utility = fixedpt_div(fixedpt_fromint(sent - mon->bytes_lost), time);
+	utility = fixedpt_mul(utility, FIXEDPT_ONE - fixedpt_div(FIXEDPT_ONE, FIXEDPT_ONE + fixedpt_exp(fixedpt_mul(fixedpt_fromint(-100), fixedpt_div(fixedpt_fromint(mon->bytes_lost), fixedpt_fromint(sent)) - fixedpt_rconst(0.05))))) - fixedpt_div(fixedpt_fromint(mon->bytes_lost), time);
 	rate = fixedpt_mul(fixedpt_div(fixedpt_fromint(sent), fixedpt_fromint(length_us)), fixedpt_rconst(1000000));
 	DBG_PRINT("[PCC] calculating utility: rate (limit): %llu, rate (actual): %llu, sent (by sequence): %llu, lost: %u, time: %u, utility: %d, sent segements: %d, sent (by segments): %u, state: %d\n", mon->rate, rate >> FIXEDPT_WBITS, mon->snd_end_seq - mon->snd_start_seq, mon->bytes_lost, length_us, (s32)(utility >> FIXEDPT_WBITS), mon->ttl,  (mon->ttl) * tp->advmss, mon->state);
 
@@ -244,6 +249,7 @@ static void on_monitor_start(struct sock *sk, int index)
 	DBG_PRINT("[PCC] raw rate is %llu (interval %d)\n", rate, index);
 	switch (ca->pcc->state) {
 		case PCC_STATE_START:
+			//rate = ca->pcc->last_actual_rate * 2;
 			rate *= 2;
 			ca->pcc->next_rate = rate;
 			should_update_base_rate = 1;
@@ -320,7 +326,7 @@ static void make_decision(struct sock *sk, struct pccdata * pcc)
 		pcc->decision_making_attempts = 0;
 
 	} else if ((pcc->decision_making_intervals[0].utility < pcc->decision_making_intervals[1].utility) &&
-			   (pcc->decision_making_intervals[2].utility < pcc->decision_making_intervals[3].utility)) {
+		(pcc->decision_making_intervals[2].utility < pcc->decision_making_intervals[3].utility)) {
 		pcc->next_rate = pcc->decision_making_intervals[1].rate;
 		pcc->state = PCC_STATE_RATE_ADJUSTMENT;
 		pcc->direction = -1;
@@ -358,6 +364,10 @@ static void on_monitor_end(struct sock *sk, int index)
 		ca->pcc->state = PCC_STATE_DECISION_MAKING_1;
 		ca->pcc->decision_making_attempts = 1;
 		ca->pcc->next_rate = prev_mon->rate;
+		if (mon->state == PCC_STATE_START) {
+			ca->pcc->next_rate = prev_mon->actual_rate;
+			DBG_PRINT("[PCC] end of start state, setting rate to %u\n", ca->pcc->next_rate);
+		}
 	}
 
 	if (mon->decision_making_id != 0) {
@@ -511,6 +521,11 @@ static void update_interval_with_received_acks(struct sock *sk)
 
 static void pcctcp_init(struct sock *sk)
 {
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct pcctcp *ca = inet_csk_ca(sk);
+
+	
+	sk->sk_pacing_rate = INITIAL_RATE;
 }
 
 static u32 ssthresh(struct sock *sk)
@@ -518,7 +533,7 @@ static u32 ssthresh(struct sock *sk)
 	struct tcp_sock *tp = tcp_sk(sk);
 
 	do_checks(sk);
-	return 0;
+	return TCP_INFINITE_SSTHRESH;
 }
 
 static void pkts_acked(struct sock *sk, const struct ack_sample * sample)
@@ -538,7 +553,7 @@ static void pkts_acked(struct sock *sk, const struct ack_sample * sample)
 
 	tp->snd_cwnd = LARGE_CWND;
 	//tp->rcv_wnd = LARGE_CWND;
-	//tp->snd_wnd = LARGE_CWND;
+	tp->snd_wnd = 0xffffff;
 	//tp->snd_cwnd_clamp = LARGE_CWND;
 }
 
