@@ -49,36 +49,36 @@ typedef enum {
 } pcc_state_t;
 
 struct monitor {
-	u8 valid;
-	u8 decision_making_id;
-	pcc_state_t state;
-	unsigned long end_time;
-	u32 snd_start_seq;
-	u32 snd_end_seq;
-	u32 last_acked_seq;
-	int ttl;
-	u32 bytes_lost;
-	u64 rate;
-	s64 utility;
-	u32 rtt;
-	struct timespec start_time;
-	u64 actual_rate;
+	u8 valid;						//1 if the monitor interval is still sending or receiving acks
+	u8 decision_making_id;			// the ID of monitor interval in the decision making quartet
+	pcc_state_t state;				//state at the start of the monitor interval
+	unsigned long end_time;			//usecs until sending ends
+	u32 snd_start_seq;				//first sequence to send in the monitor interval
+	u32 snd_end_seq;				//last sequence sent
+	u32 last_acked_seq;				//last sequence we know what happened (can be greater than snd_end_seq)
+	int segments_sent;				//segments sent in the monitor interval
+	u32 bytes_lost;					//amount of bytes lost due to sacks
+	u64 rate;						//rate limit of the monitor
+	s64 utility;					//calculated utility of the monitor
+	u32 rtt;						//last rtt captured while this monitor was active
+	struct timespec start_time;		//timestamp of the start of the monitor
+	u64 actual_rate;				//actual rate data was sent in the monitor
 };
 
 
 struct pccdata {
-	struct monitor monitor_intervals[NUMBER_OF_INTERVALS];
-	struct monitor decision_making_intervals[4];
-	u8 current_interval;
-	pcc_state_t state;
-	u64 snd_count;
-	u32 last_rtt;
-	u64 next_rate;
-	int direction;
-	int decision_making_attempts;
-	int rate_adjustment_tries;
-	int decision_directions[4];
-	u64 last_actual_rate;
+	struct monitor monitor_intervals[NUMBER_OF_INTERVALS];		//all monitor intervals
+	struct monitor decision_making_intervals[4];				//monitor intervals related to decision making will be copied here
+	u8 current_interval;										//index of the current (sending) interval
+	pcc_state_t state;											//current state
+	u64 snd_count;												//number of segments sent for the start of the connection
+	u32 last_rtt;												//last rtt measured
+	u64 next_rate;												//next base rate to send in
+	int direction;												//direction to advance rate in (-1 for lowering the rate, 1 for raising it)
+	int decision_making_attempts;								//number of decision making attempts without a clear decision
+	int rate_adjustment_tries;									//number of monitor intervals with the rate adjustment state
+	int decision_directions[4];									//for decision making shuffle
+	u64 last_actual_rate;										//last actual rate sent data in
 };
 
 
@@ -134,6 +134,7 @@ static void shuffle_decision_directions(struct sock *sk)
 	}
 }
 
+/** inits a monitor interval and sets it as inactive */
 static void init_monitor(struct monitor * mon, struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
@@ -145,7 +146,7 @@ static void init_monitor(struct monitor * mon, struct sock *sk)
 	mon->snd_start_seq = tp->snd_nxt;
 	mon->snd_end_seq = 0;
 	mon->last_acked_seq = tp->snd_nxt;
-	mon->ttl = 0;
+	mon->segments_sent = 0;
 	mon->bytes_lost = 0;
 	mon->rate = 0;
 	mon->utility = 0;
@@ -181,6 +182,7 @@ static void init_pcc_struct(struct sock *sk, struct pcctcp *ca)
 
 
 
+/** updates the segments sent of the current interval from the last call to this function */
 static void check_if_sent(struct sock *sk)
 {
 	struct pcctcp *ca = inet_csk_ca(sk);
@@ -191,17 +193,18 @@ static void check_if_sent(struct sock *sk)
 		return;
 	}
 	
-	mon->ttl += (tp->data_segs_out - ca->pcc->snd_count);
+	mon->segments_sent += (tp->data_segs_out - ca->pcc->snd_count);
 	ca->pcc->snd_count = tp->data_segs_out;
 	mon->snd_end_seq = tp->snd_nxt;
 
 }
 
+/* calculates the utility of a monitor */
 static s64 calc_utility(struct monitor * mon, struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct pcctcp *ca = inet_csk_ca(sk);
-	u64 sent = (mon->ttl) * tp->advmss;
+	u64 sent = (mon->segments_sent) * tp->advmss;
 	u64 length_us = mon->end_time + 1;
 	fixedpt rate = fixedpt_mul(fixedpt_div(fixedpt_fromint(sent), fixedpt_fromint(length_us)), fixedpt_fromint(1000000));
 	mon->actual_rate = rate >> FIXEDPT_FBITS;
@@ -231,11 +234,8 @@ static s64 calc_utility(struct monitor * mon, struct sock *sk)
 	utility = fixedpt_div(fixedpt_fromint(sent - mon->bytes_lost), time);
 	utility = fixedpt_mul(utility, FIXEDPT_ONE - fixedpt_div(FIXEDPT_ONE, FIXEDPT_ONE + fixedpt_exp(fixedpt_mul(fixedpt_fromint(-100), fixedpt_div(fixedpt_fromint(mon->bytes_lost), fixedpt_fromint(sent)) - fixedpt_rconst(0.05))))) - fixedpt_div(fixedpt_fromint(mon->bytes_lost), time);
 	rate = fixedpt_mul(fixedpt_div(fixedpt_fromint(sent), fixedpt_fromint(length_us)), fixedpt_rconst(1000000));
-	DBG_PRINT("[PCC] calculating utility: rate (limit): %llu, rate (actual): %llu, sent (by sequence): %llu, lost: %u, time: %u, utility: %d, sent segements: %d, sent (by segments): %u, state: %d\n", mon->rate, rate >> FIXEDPT_WBITS, mon->snd_end_seq - mon->snd_start_seq, mon->bytes_lost, length_us, (s32)(utility >> FIXEDPT_WBITS), mon->ttl,  (mon->ttl) * tp->advmss, mon->state);
+	DBG_PRINT("[PCC] calculating utility: rate (limit): %llu, rate (actual): %llu, sent (by sequence): %llu, lost: %u, time: %u, utility: %d, sent segements: %d, sent (by segments): %u, state: %d\n", mon->rate, rate >> FIXEDPT_WBITS, mon->snd_end_seq - mon->snd_start_seq, mon->bytes_lost, length_us, (s32)(utility >> FIXEDPT_WBITS), mon->segments_sent,  (mon->segments_sent) * tp->advmss, mon->state);
 
-	if (mon->rate > ((rate >> FIXEDPT_WBITS) / 10) * 12) {
-	//	mon->rate = ((rate >>FIXEDPT_WBITS) / 10) * 11;
-	}
 	return utility;
 }
 
@@ -345,21 +345,24 @@ static inline u32 pcc_get_rate(struct sock * sk)
 	struct pcctcp *ca = inet_csk_ca(sk);
 	return ca->pcc->monitor_intervals[ca->pcc->current_interval].rate;
 }
+
+/** called when a monitor's send period has ended and received ack for the last sent sequence */
 static void on_monitor_end(struct sock *sk, int index)
 {
 	struct pcctcp *ca = inet_csk_ca(sk);
 	struct monitor * mon = ca->pcc->monitor_intervals + index;
 	struct monitor * prev_mon = ca->pcc->monitor_intervals + PREV_MONITOR(index);
 
-	if (mon->ttl != 0 && mon->snd_end_seq != 0) {
+	if (mon->segments_sent != 0 && mon->snd_end_seq != 0) {
 		mon->utility = calc_utility(mon, sk);
 		DBG_PRINT("got utility %lld for monitor interval %d\n", mon->utility, index);
 	}
 
+	/* first monitor interval in the connection */
 	if (mon->state == PCC_STATE_START && prev_mon->snd_end_seq == 0) {
 		return;
 	}
-
+	// if in start state or in rate adjustment state, and utility is worse than last monitor, go to decision making and restor last good rate
 	if (mon->state != PCC_STATE_WAIT_FOR_DECISION && ca->pcc->snd_count > 3 && mon->utility < prev_mon->utility && ((ca->pcc->state == PCC_STATE_START) || ca->pcc->state == PCC_STATE_RATE_ADJUSTMENT)) {
 		ca->pcc->state = PCC_STATE_DECISION_MAKING_1;
 		ca->pcc->decision_making_attempts = 1;
@@ -370,10 +373,12 @@ static void on_monitor_end(struct sock *sk, int index)
 		}
 	}
 
+	//if in decision making, copy this interval
 	if (mon->decision_making_id != 0) {
 		memcpy(ca->pcc->decision_making_intervals + mon->decision_making_id - 1, mon, sizeof(struct monitor));
 	}
 
+	//last interval of decision making ended, make a decision
 	if (mon->decision_making_id == 4) {
 		make_decision(sk, ca->pcc);
 	}
@@ -385,10 +390,13 @@ static void on_interval_graceful_end(struct sock *sk, int index)
 {
 	struct pcctcp *ca = inet_csk_ca(sk);
 	struct monitor * mon = ca->pcc->monitor_intervals + index;
-	DBG_PRINT("[PCC] graceful end for monitor interval with seqs %u-%u and ttl %d and %u loss\n", mon->snd_start_seq, mon->snd_end_seq, mon->ttl, mon->bytes_lost);
+	DBG_PRINT("[PCC] graceful end for monitor interval with seqs %u-%u and segments_sent %d and %u loss\n", mon->snd_start_seq, mon->snd_end_seq, mon->segments_sent, mon->bytes_lost);
 	on_monitor_end(sk, index);
 }
 
+/** checks if current interval finished sending, and start a new if it did
+	checks if any active intervals finished receiving acks and ends them if they did
+**/
 static void check_end_of_monitor_interval(struct sock *sk)
 {
 	u8 i;
@@ -398,11 +406,13 @@ static void check_end_of_monitor_interval(struct sock *sk)
 	struct timespec length = timespec_sub(current_kernel_time(), mon->start_time);
 	u32 length_us = length.tv_sec * 1000000 + length.tv_nsec / 1000;
 
-	if (mon->ttl < 20) {
+	//make sure monitor has sent at least 20 segments
+	if (mon->segments_sent < 20) {
 		while (length_us > mon->end_time) {
 			mon->end_time += 50;
 		}
 	} else if ((mon->snd_start_seq != mon->snd_end_seq) && ((length_us > mon->end_time) )) {
+		//current interval finished sending, start a new one
 		DBG_PRINT("current monitor %d finished sending. end time should have been %u and was %u\n",ca->pcc->current_interval, mon->end_time, length_us);
 		mon->end_time = length_us;
 		ca->pcc->current_interval = (ca->pcc->current_interval + 1) % NUMBER_OF_INTERVALS;
@@ -414,6 +424,7 @@ static void check_end_of_monitor_interval(struct sock *sk)
 		}
 	}
 
+	// go over all valid intervals and check if they finished receiving
 	for (i = 0; i < NUMBER_OF_INTERVALS; i++) {
 		struct monitor *loop_mon = ca->pcc->monitor_intervals + i;
 		if (!loop_mon->valid) {
@@ -428,6 +439,7 @@ static void check_end_of_monitor_interval(struct sock *sk)
 		} 
 	}
 
+	//current monitor is invalid (started a new one probably) init it
 	if (!mon->valid) {
 		init_monitor(mon, sk);
 		if (ca->pcc->next_rate == 0) {
@@ -444,6 +456,7 @@ static void check_end_of_monitor_interval(struct sock *sk)
 	}
 }
 
+/** check if something sent and if anny monitors ended */
 static inline void do_checks(struct sock *sk)
 {
 	struct pcctcp *ca = inet_csk_ca(sk);
@@ -455,6 +468,7 @@ static inline void do_checks(struct sock *sk)
 	
 }
 
+/** change the last known sequence to all intervals and the bytes lost for relevant ones */
 static void update_interval_with_received_acks(struct sock *sk) 
 {
 	struct pcctcp *ca = inet_csk_ca(sk);
@@ -464,6 +478,7 @@ static void update_interval_with_received_acks(struct sock *sk)
 
 	init_pcc_struct(sk, ca);
 
+	//sort received sacks according to sequence in increasing order
 	if (tp->sacked_out) {
 		memcpy(sack_cache, tp->recv_sack_cache, sizeof(sack_cache));
 		for (i = 0; i < 4; i++) {
@@ -481,20 +496,27 @@ static void update_interval_with_received_acks(struct sock *sk)
 		}
 	}
 	
+	//for all active intervals check if cumulative acks changed the last known seq, or if the sacks did
 	for (i = 0; i < NUMBER_OF_INTERVALS; i++) {
 		struct monitor *loop_mon = ca->pcc->monitor_intervals + i;
 		if (!loop_mon->valid) {
 			continue;
 		}
 
+		//set the last known sequence to the last cumulative ack if it is better than the last known seq
 		if (after(tp->snd_una, loop_mon->last_acked_seq)) {
 			loop_mon->last_acked_seq = tp->snd_una;
 		}
+
+		//there are sacks
 		if (tp->sacked_out) {
 			for (j = 0; j < 4; j++) {
+				//if the sack doesn't bring any new information, check the next one
 				if (!before(loop_mon->last_acked_seq, loop_mon->snd_end_seq)) {
 					continue;
 				}
+
+				//mark the hole as lost bytes in this monitor interval
 				if (sack_cache[j].start_seq != 0 && sack_cache[j].end_seq != 0) {
 					if (before(loop_mon->last_acked_seq, sack_cache[j].start_seq)) {
 						if (before(sack_cache[j].start_seq, loop_mon->snd_end_seq)) {
@@ -508,6 +530,7 @@ static void update_interval_with_received_acks(struct sock *sk)
 						}
 
 					}
+					//update the last known seq if it was changed
 					if (after(sack_cache[j].end_seq, loop_mon->last_acked_seq)) {
 						loop_mon->last_acked_seq = sack_cache[j].end_seq;
 					}
@@ -551,6 +574,7 @@ static void pkts_acked(struct sock *sk, const struct ack_sample * sample)
 	update_interval_with_received_acks(sk);
 	do_checks(sk);
 
+	//set the congestion window to a very large size so it wouldn't matter
 	tp->snd_cwnd = LARGE_CWND;
 	//tp->rcv_wnd = LARGE_CWND;
 	tp->snd_wnd = 0xffffff;
